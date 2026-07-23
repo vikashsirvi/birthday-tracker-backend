@@ -1,0 +1,300 @@
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const { validationResult } = require('express-validator');
+const User = require('../models/User');
+const Otp = require('../models/Otp');
+const PlatformSettings = require('../models/PlatformSettings');
+const generateOtp = require('../utils/generateOtp');
+const generateToken = require('../utils/generateToken');
+const sendEmail = require('../utils/sendEmail');
+const {
+  otpEmailTemplate,
+  welcomeEmailTemplate,
+  passwordUpdatedTemplate,
+} = require('../utils/emailTemplates');
+
+const handleValidation = (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    res.status(400).json({ message: errors.array()[0].msg });
+    return false;
+  }
+  return true;
+};
+
+// @desc Register new user + send OTP
+// @route POST /api/auth/register
+const register = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { name, email, password } = req.body;
+
+  try {
+    const settings = await PlatformSettings.findOne();
+    if (settings?.maintenanceMode) {
+      return res.status(503).json({ message: 'Platform is currently under maintenance. Please try again later.' });
+    }
+    if (settings && settings.allowRegistration === false) {
+      return res.status(403).json({ message: 'New registrations are currently disabled.' });
+    }
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser && existingUser.isVerified) {
+      return res.status(400).json({ message: 'Email is already registered' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    if (existingUser && !existingUser.isVerified) {
+      existingUser.name = name;
+      existingUser.password = hashedPassword;
+      await existingUser.save();
+    } else {
+      await User.create({ name, email, password: hashedPassword });
+    }
+
+    await Otp.deleteMany({ email, purpose: 'register' });
+    const otp = generateOtp();
+    await Otp.create({ email, otp, purpose: 'register' });
+
+    await sendEmail({
+      to: email,
+      subject: 'Verify Your Email - Birthday Tracker',
+      html: otpEmailTemplate(otp, 'register'),
+      type: 'otp',
+    });
+
+    res.status(200).json({ message: 'OTP sent to your email successfully', email });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Registration failed' });
+  }
+};
+
+// @desc Verify OTP for registration
+// @route POST /api/auth/verify-otp
+const verifyOtp = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { email, otp } = req.body;
+
+  try {
+    const otpRecord = await Otp.findOne({ email, otp, purpose: 'register' });
+    if (!otpRecord) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.isVerified = true;
+    await user.save();
+
+    await Otp.deleteMany({ email, purpose: 'register' });
+
+    await sendEmail({
+      to: email,
+      subject: 'Registration Successful - Birthday Tracker',
+      html: welcomeEmailTemplate(user.name),
+      type: 'welcome',
+      userId: user._id,
+    });
+
+    res.status(200).json({ message: 'Email verified successfully. Registration complete!' });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'OTP verification failed' });
+  }
+};
+
+// @desc Resend OTP (register or forgot-password)
+// @route POST /api/auth/resend-otp
+const resendOtp = async (req, res) => {
+  const { email, type } = req.body;
+
+  if (!email || !type) {
+    return res.status(400).json({ message: 'Email and type are required' });
+  }
+
+  try {
+    const purpose = type === 'register' ? 'register' : 'forgot-password';
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'No account found with this email' });
+    }
+
+    await Otp.deleteMany({ email, purpose });
+    const otp = generateOtp();
+    await Otp.create({ email, otp, purpose });
+
+    await sendEmail({
+      to: email,
+      subject: 'Your New OTP - Birthday Tracker',
+      html: otpEmailTemplate(otp, purpose),
+      type: 'otp',
+      userId: user._id,
+    });
+
+    res.status(200).json({ message: 'OTP resent successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to resend OTP' });
+  }
+};
+
+// @desc Login (role-based - admin/user share same endpoint)
+// @route POST /api/auth/login
+const login = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { email, password } = req.body;
+
+  try {
+    const settings = await PlatformSettings.findOne();
+    if (settings?.maintenanceMode) {
+      return res.status(503).json({ message: 'Platform is currently under maintenance. Please try again later.' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid email or password' });
+    }
+
+    if (user.isSuspended) {
+      return res.status(403).json({ message: 'Your account has been suspended. Please contact support.' });
+    }
+
+    if (!user.isVerified) {
+      return res.status(403).json({ message: 'Please verify your email before logging in' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: 'Invalid email or password' });
+    }
+
+    const token = generateToken(user);
+
+    res.status(200).json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Login failed' });
+  }
+};
+
+// @desc Forgot Password - send OTP
+// @route POST /api/auth/forgot-password
+const forgotPassword = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { email } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'No account found with this email' });
+    }
+
+    await Otp.deleteMany({ email, purpose: 'forgot-password' });
+    const otp = generateOtp();
+    await Otp.create({ email, otp, purpose: 'forgot-password' });
+
+    await sendEmail({
+      to: email,
+      subject: 'Reset Your Password - Birthday Tracker',
+      html: otpEmailTemplate(otp, 'forgot-password'),
+      type: 'otp',
+      userId: user._id,
+    });
+
+    res.status(200).json({ message: 'OTP sent to your email successfully', email });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to send OTP' });
+  }
+};
+
+// @desc Verify OTP for password reset -> issue short-lived resetToken
+// @route POST /api/auth/verify-reset-otp
+const verifyResetOtp = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { email, otp } = req.body;
+
+  try {
+    const otpRecord = await Otp.findOne({ email, otp, purpose: 'forgot-password' });
+    if (!otpRecord) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    otpRecord.verified = true;
+    otpRecord.resetToken = resetToken;
+    await otpRecord.save();
+
+    res.status(200).json({ message: 'OTP verified successfully', resetToken });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'OTP verification failed' });
+  }
+};
+
+// @desc Reset Password (requires valid resetToken issued after OTP verification)
+// @route POST /api/auth/reset-password
+const resetPassword = async (req, res) => {
+  if (!handleValidation(req, res)) return;
+
+  const { email, resetToken, password } = req.body;
+
+  try {
+    const otpRecord = await Otp.findOne({
+      email,
+      purpose: 'forgot-password',
+      verified: true,
+      resetToken,
+    });
+
+    if (!otpRecord) {
+      return res.status(400).json({ message: 'Invalid or expired reset session. Please try again.' });
+    }
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    user.password = await bcrypt.hash(password, 10);
+    await user.save();
+
+    await Otp.deleteMany({ email, purpose: 'forgot-password' });
+
+    await sendEmail({
+      to: email,
+      subject: 'Password Updated Successfully - Birthday Tracker',
+      html: passwordUpdatedTemplate(user.name),
+      type: 'password-reset',
+      userId: user._id,
+    });
+
+    res.status(200).json({ message: 'Password updated successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to reset password' });
+  }
+};
+
+module.exports = {
+  register,
+  verifyOtp,
+  resendOtp,
+  login,
+  forgotPassword,
+  verifyResetOtp,
+  resetPassword,
+};
