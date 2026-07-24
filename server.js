@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const dotenv = require('dotenv');
+
 dotenv.config();
 
 const connectDB = require('./config/db');
@@ -33,14 +34,13 @@ ensurePlatformSettings();
 
 const app = express();
 
-// CORS Configuration - સ્લેશ (/) હટાવી દીધો છે
 app.use(cors({
-  origin: ['https://birthday-tracker-frontend-coral.vercel.app', 'http://localhost:3000'],
+  origin: [
+    'https://birthday-tracker-frontend-coral.vercel.app',
+    'http://localhost:3000',
+  ],
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
 app.use(helmet());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
