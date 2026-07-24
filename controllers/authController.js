@@ -150,14 +150,15 @@ const login = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const settings = await PlatformSettings.findOne();
-    if (settings?.maintenanceMode) {
-      return res.status(503).json({ message: 'Platform is currently under maintenance. Please try again later.' });
-    }
-
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(400).json({ message: 'Invalid email or password' });
+    }
+
+    // Allow admin to log in even during maintenance mode so they can disable it
+    const settings = await PlatformSettings.findOne();
+    if (settings?.maintenanceMode && user.role !== 'admin') {
+      return res.status(503).json({ message: 'Platform is currently under maintenance. Please try again later.' });
     }
 
     if (user.isSuspended) {
